@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,8 +45,27 @@ func send(code int) httprouter.Handle {
 	}
 }
 
-func assertNoCSRFCookieInResponse(t *testing.T, ts *httptest.Server, c *http.Client, res *http.Response) {
-	assert.Len(t, res.Cookies(), 0, res.Cookies())
+func getSessionCookie(t *testing.T, r *http.Response) *http.Cookie {
+	var sessionCookie *http.Cookie
+	var found bool
+	for _, c := range r.Cookies() {
+		if c.Name == config.DefaultSessionCookieName {
+			found = true
+			sessionCookie = c
+		}
+	}
+	require.True(t, found)
+	return sessionCookie
+}
+
+func assertNoCSRFCookieInResponse(t *testing.T, _ *httptest.Server, _ *http.Client, r *http.Response) {
+	found := false
+	for _, c := range r.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_token") {
+			found = true
+		}
+	}
+	require.False(t, found)
 }
 
 func TestSessionWhoAmI(t *testing.T) {
@@ -140,8 +160,6 @@ func TestSessionWhoAmI(t *testing.T) {
 	})
 
 	/*
-
-
 		t.Run("case=respects AAL config", func(t *testing.T) {
 			conf.MustSet(config.ViperKeySessionLifespan, "1m")
 
@@ -379,7 +397,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 		require.NoError(t, reg.SessionPersister().UpsertSession(ctx, s))
 
 		t.Run("should list session", func(t *testing.T) {
-			req, _ := http.NewRequest("GET", ts.URL+"/identities/"+i.ID.String()+"/sessions", nil)
+			req, _ := http.NewRequest("GET", ts.URL+"/admin/identities/"+i.ID.String()+"/sessions", nil)
 			res, err := client.Do(req)
 			require.NoError(t, err)
 			assert.Equal(t, http.StatusOK, res.StatusCode)
@@ -390,7 +408,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			assert.Equal(t, s.ID, sessions[0].ID)
 		})
 
-		req, _ := http.NewRequest("DELETE", ts.URL+"/identities/"+i.ID.String()+"/sessions", nil)
+		req, _ := http.NewRequest("DELETE", ts.URL+"/admin/identities/"+i.ID.String()+"/sessions", nil)
 		res, err := client.Do(req)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusNoContent, res.StatusCode)
@@ -399,7 +417,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 		require.True(t, errors.Is(err, sqlcon.ErrNoRows))
 
 		t.Run("should not list session", func(t *testing.T) {
-			req, _ := http.NewRequest("GET", ts.URL+"/identities/"+i.ID.String()+"/sessions", nil)
+			req, _ := http.NewRequest("GET", ts.URL+"/admin/identities/"+i.ID.String()+"/sessions", nil)
 			res, err := client.Do(req)
 			require.NoError(t, err)
 			assert.Equal(t, http.StatusOK, res.StatusCode)
@@ -415,7 +433,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 
 		for _, method := range []string{http.MethodGet, http.MethodDelete} {
 			t.Run("http method="+method, func(t *testing.T) {
-				req, _ := http.NewRequest(method, ts.URL+"/identities/BADUUID/sessions", nil)
+				req, _ := http.NewRequest(method, ts.URL+"/admin/identities/BADUUID/sessions", nil)
 				res, err := client.Do(req)
 				require.NoError(t, err)
 				require.Equal(t, http.StatusBadRequest, res.StatusCode)
@@ -426,7 +444,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 	t.Run("case=should return 404 when deleting with unknown UUID", func(t *testing.T) {
 		client := testhelpers.NewClientWithCookies(t)
 		someID, _ := uuid.NewV4()
-		req, _ := http.NewRequest("DELETE", ts.URL+"/identities/"+someID.String()+"/sessions", nil)
+		req, _ := http.NewRequest("DELETE", ts.URL+"/admin/identities/"+someID.String()+"/sessions", nil)
 		res, err := client.Do(req)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusNotFound, res.StatusCode)
@@ -463,7 +481,7 @@ func TestHandlerAdminSessionManagement(t *testing.T) {
 			},
 		} {
 			t.Run(fmt.Sprintf("active=%#v", tc.activeOnly), func(t *testing.T) {
-				reqURL := ts.URL + "/identities/" + i.ID.String() + "/sessions"
+				reqURL := ts.URL + "/admin/identities/" + i.ID.String() + "/sessions"
 				if tc.activeOnly != "" {
 					reqURL += "?active=" + tc.activeOnly
 				}
@@ -598,5 +616,48 @@ func TestHandlerSelfServiceSessionManagement(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, http.StatusNoContent, resp.StatusCode, "case=%d", j)
 		}
+	})
+}
+
+func TestHandlerRefreshSessionBySessionID(t *testing.T) {
+	conf, reg := internal.NewFastRegistryWithMocks(t)
+	_, ts, _, _ := testhelpers.NewKratosServerWithCSRFAndRouters(t, reg)
+
+	// set this intermediate because kratos needs some valid url for CRUDE operations
+	conf.MustSet(config.ViperKeyPublicBaseURL, "http://example.com")
+	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
+	conf.MustSet(config.ViperKeyPublicBaseURL, ts.URL)
+
+	t.Run("case=should return 200 after refreshing one session", func(t *testing.T) {
+		client := testhelpers.NewClientWithCookies(t)
+		i := identity.NewIdentity("")
+		require.NoError(t, reg.IdentityManager().Create(context.Background(), i))
+		s := &Session{Identity: i, ExpiresAt: time.Now().Add(5 * time.Minute)}
+		require.NoError(t, reg.SessionPersister().UpsertSession(context.Background(), s))
+
+		req, _ := http.NewRequest("PATCH", ts.URL+"/admin/sessions/"+s.ID.String()+"/extend", nil)
+		res, err := client.Do(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, res.StatusCode)
+
+		s, err = reg.SessionPersister().GetSession(context.Background(), s.ID)
+		require.Nil(t, err)
+	})
+
+	t.Run("case=should return 400 when bad UUID is sent", func(t *testing.T) {
+		client := testhelpers.NewClientWithCookies(t)
+		req, _ := http.NewRequest("PATCH", ts.URL+"/admin/sessions/BADUUID/extend", nil)
+		res, err := client.Do(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusBadRequest, res.StatusCode)
+	})
+
+	t.Run("case=should return 404 when calling with missing UUID", func(t *testing.T) {
+		client := testhelpers.NewClientWithCookies(t)
+		someID, _ := uuid.NewV4()
+		req, _ := http.NewRequest("PATCH", ts.URL+"/admin/sessions/"+someID.String()+"/extend", nil)
+		res, err := client.Do(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusNotFound, res.StatusCode)
 	})
 }

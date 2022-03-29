@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/gobuffalo/pop/v6"
+
 	"github.com/ory/kratos/text"
 
 	"github.com/tidwall/gjson"
@@ -125,7 +127,7 @@ func NewFlow(conf *config.Config, exp time.Duration, r *http.Request, i *identit
 	_, err := x.SecureRedirectTo(r,
 		conf.SelfServiceBrowserDefaultReturnTo(),
 		x.SecureRedirectUseSourceURL(requestURL),
-		x.SecureRedirectAllowURLs(conf.SelfServiceBrowserWhitelistedReturnToDomains()),
+		x.SecureRedirectAllowURLs(conf.SelfServiceBrowserAllowedReturnToDomains()),
 		x.SecureRedirectAllowSelfServiceURLs(conf.SelfPublicURL()),
 	)
 	if err != nil {
@@ -194,8 +196,22 @@ func (f *Flow) EnsureInternalContext() {
 
 func (f Flow) MarshalJSON() ([]byte, error) {
 	type local Flow
+	f.SetReturnTo()
+	return json.Marshal(local(f))
+}
+
+func (f *Flow) SetReturnTo() {
 	if u, err := url.Parse(f.RequestURL); err == nil {
 		f.ReturnTo = u.Query().Get("return_to")
 	}
-	return json.Marshal(local(f))
+}
+
+func (f *Flow) AfterFind(*pop.Connection) error {
+	f.SetReturnTo()
+	return nil
+}
+
+func (f *Flow) AfterSave(*pop.Connection) error {
+	f.SetReturnTo()
+	return nil
 }
